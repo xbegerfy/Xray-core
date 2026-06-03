@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	"encoding/binary"
+	"math"
 	"strings"
 	"time"
 
@@ -13,10 +14,12 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	dns_feature "github.com/xtls/xray-core/features/dns"
+
 	"golang.org/x/net/dns/dnsmessage"
 )
 
 // Fqdn normalizes domain make sure it ends with '.'
+// case-sensitive
 func Fqdn(domain string) string {
 	if len(domain) > 0 && strings.HasSuffix(domain, ".") {
 		return domain
@@ -38,19 +41,14 @@ type IPRecord struct {
 	RawHeader *dnsmessage.Header
 }
 
-func (r *IPRecord) getIPs() ([]net.IP, uint32, error) {
+func (r *IPRecord) getIPs() ([]net.IP, int32, error) {
 	if r == nil {
 		return nil, 0, errRecordNotFound
 	}
-	untilExpire := time.Until(r.Expire).Seconds()
-	if untilExpire <= 0 {
-		return nil, 0, errRecordNotFound
-	}
 
-	ttl := uint32(untilExpire) + 1
-	if ttl == 1 {
-		r.Expire = time.Now().Add(time.Second) // To ensure that two consecutive requests get the same result
-	}
+	untilExpire := time.Until(r.Expire).Seconds()
+	ttl := int32(math.Ceil(untilExpire))
+
 	if r.RCode != dnsmessage.RCodeSuccess {
 		return nil, ttl, dns_feature.RCodeError(r.RCode)
 	}
@@ -129,15 +127,20 @@ func genEDNS0Options(clientIP net.IP, padding int) *dnsmessage.Resource {
 	return opt
 }
 
-func buildReqMsgs(domain string, option dns_feature.IPOption, reqIDGen func() uint16, reqOpts *dnsmessage.Resource) []*dnsRequest {
+func buildReqMsgs(domain string, option dns_feature.IPOption, reqIDGen func() uint16, reqOpts *dnsmessage.Resource) ([]*dnsRequest, error) {
+	name, err := dnsmessage.NewName(domain)
+	if err != nil {
+		return nil, err
+	}
+
 	qA := dnsmessage.Question{
-		Name:  dnsmessage.MustNewName(domain),
+		Name:  name,
 		Type:  dnsmessage.TypeA,
 		Class: dnsmessage.ClassINET,
 	}
 
 	qAAAA := dnsmessage.Question{
-		Name:  dnsmessage.MustNewName(domain),
+		Name:  name,
 		Type:  dnsmessage.TypeAAAA,
 		Class: dnsmessage.ClassINET,
 	}
@@ -177,7 +180,7 @@ func buildReqMsgs(domain string, option dns_feature.IPOption, reqIDGen func() ui
 		})
 	}
 
-	return reqs
+	return reqs, nil
 }
 
 // parseResponse parses DNS answers from the returned payload
