@@ -78,11 +78,11 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	}
 }
 
-func (u *udpConnectionHandler) connectionFinished(src net.Destination) {
+func (u *udpConnectionHandler) connectionFinished(conn *udpConn) {
 	u.Lock()
-	conn, found := u.udpConns[src]
-	if found {
-		delete(u.udpConns, src)
+	// Close runs twice per flow; a newer conn may already own this src.
+	if u.udpConns[conn.src] == conn {
+		delete(u.udpConns, conn.src)
 		close(conn.egress)
 	}
 	u.Unlock()
@@ -98,18 +98,22 @@ type udpConn struct {
 }
 
 func (c *udpConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
-	e, ok := <-c.egress
-	if !ok {
-		return nil, io.EOF
-	}
+	for {
+		e, ok := <-c.egress
+		if !ok {
+			return nil, io.EOF
+		}
 
-	b := buf.New()
-	if _, err := b.Write(e.data); err != nil {
-		return nil, err
-	}
-	b.UDP = e.dest
+		b := buf.New()
+		if _, err := b.Write(e.data); err != nil {
+			errors.LogErrorInner(context.Background(), err, "drop packet to ", e.dest, " with size ", len(e.data))
+			b.Release()
+			continue
+		}
+		b.UDP = e.dest
 
-	return buf.MultiBuffer{b}, nil
+		return buf.MultiBuffer{b}, nil
+	}
 }
 
 // Read packets from the connection
@@ -129,7 +133,11 @@ func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	for i, b := range mb {
 		dst := c.dst
 		if b.UDP != nil {
-			dst = *b.UDP
+			if b.UDP.Address.Family().IsDomain() {
+				errors.LogError(context.Background(), "impossible domain packet ", b.UDP, " reply via original target ", dst)
+			} else {
+				dst = *b.UDP
+			}
 		}
 		err := c.handler.writePacket(b.Bytes(), dst, c.src)
 		if err != nil {
@@ -153,7 +161,7 @@ func (c *udpConn) Write(p []byte) (int, error) {
 }
 
 func (c *udpConn) Close() error {
-	c.handler.connectionFinished(c.src)
+	c.handler.connectionFinished(c)
 
 	return nil
 }
